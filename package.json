@@ -5,7 +5,8 @@
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "scrape:bentkey": "node scripts/scrape-bentkey.js"
+    "scrape:bentkey": "node scripts/scrape-bentkey.js",
+    "scrape:amazon-prime-kids": "node scripts/scrape-amazon-prime-kids.js"
   },
   "keywords": [],
   "author": "",

@@ -1,8 +1,6 @@
 #!/usr/bin/env node
 const fs = require("node:fs");
 const path = require("node:path");
-const readline = require("node:readline/promises");
-const { stdin, stdout } = require("node:process");
 const { chromium } = require("playwright");
 
 const BASE_URL = "https://www.bentkey.com";
@@ -46,6 +44,14 @@ function getCredentials() {
   return { email, password };
 }
 
+function buildOutputPrefix(scrapedUrl) {
+  const url = new URL(scrapedUrl);
+  const host = url.hostname.replace(/[^a-z0-9]+/gi, "_");
+  const pathname = url.pathname.replace(/[^a-z0-9]+/gi, "_").replace(/^_+|_+$/g, "");
+  const page = pathname || "root";
+  return `${host}_${page}_shows`.toLowerCase();
+}
+
 async function clickIfPresent(page, selectorOrRole) {
   try {
     if (selectorOrRole.type === "role") {
@@ -84,17 +90,41 @@ async function login(page, email, password) {
     name: /allow all/i,
   });
 
-  const emailInput = page.locator("#email-signup-input");
+  const emailInput = page.locator('input[type="email"], #email-signup-input').first();
   await emailInput.fill(email);
   await page.getByRole("button", { name: /continue/i }).click();
 
-  const passwordInput = page.locator("#password-signup-input");
+  const passwordInput = page
+    .locator('input[type="password"], #password-signup-input')
+    .first();
+  await passwordInput.waitFor({ state: "visible", timeout: 15000 });
   await passwordInput.fill(password);
-  await page.getByRole("button", { name: "Log In", exact: true }).click();
+  const loginButton = page.locator("#login");
+  if (await loginButton.first().isVisible().catch(() => false)) {
+    await loginButton.first().click();
+  } else {
+    await page.getByRole("button", { name: "Log In", exact: true }).last().click();
+  }
 
-  await page.waitForURL((url) => {
-    return url.hostname === "www.bentkey.com" && url.pathname === "/";
-  });
+  const loginPathRegex = /\/login\/?$/;
+  const urlChanged = page
+    .waitForURL((url) => {
+      return url.hostname === "www.bentkey.com" && !loginPathRegex.test(url.pathname);
+    }, { timeout: 20000 })
+    .then(() => true)
+    .catch(() => false);
+  const avatarVisible = page
+    .getByRole("button", { name: /signed in avatar/i })
+    .first()
+    .waitFor({ state: "visible", timeout: 20000 })
+    .then(() => true)
+    .catch(() => false);
+
+  const [urlOk, avatarOk] = await Promise.all([urlChanged, avatarVisible]);
+  const loginSucceeded = urlOk || avatarOk;
+  if (!loginSucceeded) {
+    throw new Error(`Login did not complete. Current URL: ${page.url()}`);
+  }
 }
 
 async function scrapeShows(page) {
@@ -148,140 +178,21 @@ async function scrapeShows(page) {
   return shows;
 }
 
-async function promptShow(shows) {
-  const rl = readline.createInterface({ input: stdin, output: stdout });
-  try {
-    console.log("\nAvailable shows:");
-    for (let i = 0; i < shows.length; i += 1) {
-      const show = shows[i];
-      console.log(`${String(i + 1).padStart(2, " ")}. ${show.title} (${show.modalId})`);
-    }
-
-    while (true) {
-      const answer = await rl.question("\nChoose show number to scrape episodes: ");
-      const n = Number.parseInt(answer, 10);
-      if (Number.isInteger(n) && n >= 1 && n <= shows.length) {
-        return shows[n - 1];
-      }
-      console.log(`Invalid selection "${answer}". Enter a number from 1-${shows.length}.`);
-    }
-  } finally {
-    rl.close();
-  }
-}
-
-async function scrapeEpisodes(page, show) {
-  await page.goto(show.url, { waitUntil: "domcontentloaded" });
-  await page.waitForSelector("#show-modal-content-container", { timeout: 20000 });
-  await page.waitForTimeout(1200);
-
-  const episodes = await page.evaluate(() => {
-    const nodes = [
-      ...document.querySelectorAll(
-        "#show-modal-content-container episode-element[data-episode-details]"
-      ),
-    ];
-
-    const toAbsoluteUrl = (value) => {
-      if (!value || typeof value !== "string") return "";
-      if (/^https?:\/\//i.test(value)) return value;
-      if (value.startsWith("//")) return `${window.location.protocol}${value}`;
-      if (value.startsWith("/")) return `${window.location.origin}${value}`;
-      return "";
-    };
-
-    const collectStringUrls = (value, out, seen) => {
-      if (!value) return;
-      if (typeof value === "string") {
-        const normalized = toAbsoluteUrl(value.trim());
-        if (normalized && !seen.has(normalized)) {
-          seen.add(normalized);
-          out.push(normalized);
-        }
-        return;
-      }
-      if (Array.isArray(value)) {
-        for (const item of value) collectStringUrls(item, out, seen);
-        return;
-      }
-      if (typeof value === "object") {
-        for (const nested of Object.values(value)) {
-          collectStringUrls(nested, out, seen);
-        }
-      }
-    };
-
-    const out = [];
-    for (const node of nodes) {
-      const raw = node.getAttribute("data-episode-details");
-      if (!raw) continue;
-
-      let episode;
-      try {
-        episode = JSON.parse(raw);
-      } catch (_) {
-        continue;
-      }
-
-      const videoId = episode?.videos?.main?.id;
-      if (!videoId) continue;
-      const img = node.querySelector("img");
-      const metadataImageCandidates = [];
-      const seen = new Set();
-      collectStringUrls(episode?.images, metadataImageCandidates, seen);
-      collectStringUrls(episode?.videos?.main?.images, metadataImageCandidates, seen);
-      collectStringUrls(episode?.videos?.main?.thumbnails, metadataImageCandidates, seen);
-      collectStringUrls(episode?.videos?.main?.poster, metadataImageCandidates, seen);
-      const imageUrl =
-        toAbsoluteUrl(img?.currentSrc) ||
-        toAbsoluteUrl(img?.getAttribute("src")) ||
-        toAbsoluteUrl(img?.getAttribute("data-src")) ||
-        metadataImageCandidates[0] ||
-        "";
-
-      out.push({
-        season: episode?.showData?.seasonNumber || null,
-        number: episode?.number || null,
-        title: episode?.strings?.title || "",
-        imageUrl,
-        videoId,
-        url: `${window.location.origin}/play/${videoId}/`,
-      });
-    }
-
-    return out;
-  });
-
-  if (!episodes.length) {
-    throw new Error(
-      `No episodes found for ${show.modalId}. The show may not expose episode data in this modal.`
-    );
-  }
-
-  episodes.sort((a, b) => {
-    const seasonA = a.season || 0;
-    const seasonB = b.season || 0;
-    if (seasonA !== seasonB) return seasonA - seasonB;
-    return (a.number || 0) - (b.number || 0);
-  });
-
-  return episodes;
-}
-
-function saveOutput(shows, selectedShow, episodes) {
+function saveOutput(shows, scrapedUrl) {
   fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+  const outputPrefix = buildOutputPrefix(scrapedUrl);
+  const scrapedAt = new Date().toISOString();
 
-  const showsPath = path.join(OUTPUT_DIR, "all_shows.json");
-  fs.writeFileSync(showsPath, `${JSON.stringify(shows, null, 2)}\n`, "utf8");
-
-  const jsonPath = path.join(OUTPUT_DIR, `${selectedShow.modalId}_episodes.json`);
+  const showsPath = path.join(OUTPUT_DIR, `${outputPrefix}.json`);
   fs.writeFileSync(
-    jsonPath,
+    showsPath,
     `${JSON.stringify(
       {
-        show: selectedShow,
-        episodeCount: episodes.length,
-        episodes,
+        scrapedFrom: scrapedUrl,
+        scrapedAt,
+        itemType: "show",
+        itemCount: shows.length,
+        items: shows,
       },
       null,
       2
@@ -289,15 +200,11 @@ function saveOutput(shows, selectedShow, episodes) {
     "utf8"
   );
 
-  const txtPath = path.join(OUTPUT_DIR, `${selectedShow.modalId}_episode_urls.txt`);
-  const lines = episodes.map((ep) => {
-    const season = ep.season == null ? "S?" : `S${ep.season}`;
-    const num = ep.number == null ? "E?" : `E${ep.number}`;
-    return `${season}${num} ${ep.title} ${ep.url}`.trim();
-  });
+  const txtPath = path.join(OUTPUT_DIR, `${outputPrefix}_urls.txt`);
+  const lines = shows.map((show) => `${show.title} ${show.url}`.trim());
   fs.writeFileSync(txtPath, `${lines.join("\n")}\n`, "utf8");
 
-  return { showsPath, jsonPath, txtPath };
+  return { showsPath, txtPath };
 }
 
 async function main() {
@@ -315,16 +222,9 @@ async function main() {
     const shows = await scrapeShows(page);
     console.log(`Found ${shows.length} unique shows.`);
 
-    const selectedShow = await promptShow(shows);
-    console.log(`Scraping episodes for: ${selectedShow.title} (${selectedShow.modalId})`);
-
-    const episodes = await scrapeEpisodes(page, selectedShow);
-    console.log(`Found ${episodes.length} episodes.`);
-
-    const files = saveOutput(shows, selectedShow, episodes);
+    const files = saveOutput(shows, `${BASE_URL}/`);
     console.log("\nSaved files:");
     console.log(`- ${files.showsPath}`);
-    console.log(`- ${files.jsonPath}`);
     console.log(`- ${files.txtPath}`);
   } finally {
     await context.close();
